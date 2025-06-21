@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+/* eslint-disable no-process-env */
 import 'dotenv/config'
 
 import fs from 'node:fs/promises'
@@ -7,11 +9,9 @@ import { input } from '@inquirer/prompts'
 import delay from 'delay'
 import { chromium, type Locator } from 'playwright'
 
-import type { BookInfo, BookMeta, BookMetadata, PageChunk } from './types'
 import {
   assert,
   deromanize,
-  getEnv,
   normalizeAuthors,
   parseJsonpResponse
 } from './utils'
@@ -27,10 +27,17 @@ interface TocItem extends PageNav {
   locator?: Locator
 }
 
+interface PageChunk {
+  index: number
+  page: number
+  total: number
+  screenshot: string
+}
+
 async function main() {
-  const asin = getEnv('ASIN')
-  const amazonEmail = getEnv('AMAZON_EMAIL')
-  const amazonPassword = getEnv('AMAZON_PASSWORD')
+  const asin = process.env.ASIN
+  const amazonEmail = process.env.AMAZON_EMAIL
+  const amazonPassword = process.env.AMAZON_PASSWORD
   assert(asin, 'ASIN is required')
   assert(amazonEmail, 'AMAZON_EMAIL is required')
   assert(amazonPassword, 'AMAZON_PASSWORD is required')
@@ -41,7 +48,6 @@ async function main() {
   await fs.mkdir(userDataDir, { recursive: true })
   await fs.mkdir(pageScreenshotsDir, { recursive: true })
 
-  const krRendererMainImageSelector = '#kr-renderer .kg-full-page-img img'
   const bookReaderUrl = `https://read.amazon.com/?asin=${asin}`
 
   const context = await chromium.launchPersistentContext(userDataDir, {
@@ -56,36 +62,34 @@ async function main() {
   })
   const page = await context.newPage()
 
-  let info: BookInfo | undefined
-  let meta: BookMeta | undefined
+  let info: any
+  let meta: any
 
   page.on('response', async (response) => {
-    try {
-      const status = response.status()
-      if (status !== 200) return
+    const status = response.status()
+    if (status !== 200) return
 
-      const url = new URL(response.url())
-      if (
-        url.hostname === 'read.amazon.com' &&
-        url.pathname === '/service/mobile/reader/startReading' &&
-        url.searchParams.get('asin')?.toLowerCase() === asin.toLowerCase()
-      ) {
-        const body: any = await response.json()
-        delete body.karamelToken
-        delete body.metadataUrl
-        delete body.YJFormatVersion
-        info = body
-      } else if (url.pathname.endsWith('YJmetadata.jsonp')) {
-        const body = await response.text()
-        const metadata = parseJsonpResponse<any>(body)
-        if (metadata.asin !== asin) return
-        delete metadata.cpr
-        if (Array.isArray(metadata.authorsList)) {
-          metadata.authorsList = normalizeAuthors(metadata.authorsList)
-        }
-        meta = metadata
+    const url = new URL(response.url())
+    if (
+      url.hostname === 'read.amazon.com' &&
+      url.pathname === '/service/mobile/reader/startReading' &&
+      url.searchParams.get('asin')?.toLowerCase() === asin.toLowerCase()
+    ) {
+      const body: any = await response.json()
+      delete body.karamelToken
+      delete body.metadataUrl
+      delete body.YJFormatVersion
+      info = body
+    } else if (url.pathname.endsWith('YJmetadata.jsonp')) {
+      const body = await response.text()
+      const metadata = parseJsonpResponse<any>(body)
+      if (metadata.asin !== asin) return
+      delete metadata.cpr
+      if (Array.isArray(metadata.authorsList)) {
+        metadata.authorsList = normalizeAuthors(metadata.authorsList)
       }
-    } catch {}
+      meta = metadata
+    }
   })
 
   await Promise.any([
@@ -249,6 +253,13 @@ async function main() {
   await page.locator('.side-menu-close-button').click()
   await delay(1000)
 
+  // Save the metadata before we start the long screenshotting process
+  const result = { info, meta, toc }
+  await fs.writeFile(
+    path.join(outDir, 'metadata.json'),
+    JSON.stringify(result, null, 2)
+  )
+
   const pages: Array<PageChunk> = []
   console.warn(
     `reading ${totalContentPages} pages${total > totalContentPages ? ` (of ${total} total pages stopping at "${parsedToc.afterLastPageTocItem!.title}")` : ''}...`
@@ -266,11 +277,11 @@ async function main() {
     const index = pages.length
 
     const src = await page
-      .locator(krRendererMainImageSelector)
+      .locator('#kr-renderer .kg-full-page-img img')
       .getAttribute('src')
 
     const b = await page
-      .locator(krRendererMainImageSelector)
+      .locator('#kr-renderer .kg-full-page-img img')
       .screenshot({ type: 'png', scale: 'css' })
 
     const screenshotPath = path.join(
@@ -298,10 +309,10 @@ async function main() {
       break
     }
 
-    let retries = 0
-
     // Occasionally the next page button doesn't work, so ensure that the main
     // image src actually changes before continuing.
+    let retries = 0
+
     do {
       try {
         // Navigate to the next page
@@ -315,7 +326,6 @@ async function main() {
             })
           }
 
-          // Click the next page button
           await page
             .locator('.kr-chevron-container-right')
             .click({ timeout: 1000 })
@@ -331,7 +341,7 @@ async function main() {
       }
 
       const newSrc = await page
-        .locator(krRendererMainImageSelector)
+        .locator('#kr-renderer .kg-full-page-img img')
         .getAttribute('src')
       if (newSrc !== src) {
         break
@@ -347,12 +357,14 @@ async function main() {
     } while (true)
   } while (true)
 
-  const result: BookMetadata = { info: info!, meta: meta!, toc, pages }
-  await fs.writeFile(
-    path.join(outDir, 'metadata.json'),
-    JSON.stringify(result, null, 2)
-  )
-  console.log(JSON.stringify(result, null, 2))
+  // We're intentionally not re-writing the metadata file here because it was
+  // already written above, and the pages array is not used by other scripts.
+  // const result = { info, meta, toc, pages }
+  // await fs.writeFile(
+  //   path.join(outDir, 'metadata.json'),
+  //   JSON.stringify(result, null, 2)
+  // )
+  console.log(JSON.stringify({ info, meta, toc, pages }, null, 2))
 
   if (initialPageNav?.page !== undefined) {
     console.warn(`resetting back to initial page ${initialPageNav.page}...`)
@@ -447,4 +459,49 @@ function parseTocItems(tocItems: TocItem[]) {
   }
 }
 
-await main()
+// fetch(
+//   'https://read.amazon.com/service/mobile/reader/startReading?asin=B0819W19WD&clientVersion=20000100',
+//   {
+//     headers: {
+//       accept: '*/*',
+//       'accept-language': 'en-US,en;q=0.9',
+//       'device-memory': '8',
+//       downlink: '10',
+//       dpr: '2',
+//       ect: '4g',
+//       priority: 'u=1, i',
+//       rtt: '50',
+//       'sec-ch-device-memory': '8',
+//       'sec-ch-dpr': '2',
+//       'sec-ch-ua':
+//         '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+//       'sec-ch-ua-mobile': '?0',
+//       'sec-ch-ua-platform': '"macOS"',
+//       'sec-ch-viewport-width': '1728',
+//       'sec-fetch-dest': 'empty',
+//       'sec-fetch-mode': 'cors',
+//       'sec-fetch-site': 'same-origin',
+//       'viewport-width': '1728',
+//       'x-adp-session-token': null,
+//       cookie: null,
+//       Referer: 'https://read.amazon.com/?asin=B0819W19WD&ref_=kwl_kr_iv_rec_1',
+//       'Referrer-Policy': 'strict-origin-when-cross-origin'
+//     },
+//     body: null,
+//     method: 'GET'
+//   }
+// )
+
+// fetch(
+//   'https://k4wyjmetadata.s3.amazonaws.com/books2/B0819W19WD/da38557c/CR%21WPPV87W8317H7FWJRF6JFMVE7SJY/book/YJmetadata.jsonp',
+//   {
+//     method: 'GET'
+//   }
+// )
+
+try {
+  await main()
+} catch (err) {
+  console.error('error', err)
+  process.exit(1)
+}
